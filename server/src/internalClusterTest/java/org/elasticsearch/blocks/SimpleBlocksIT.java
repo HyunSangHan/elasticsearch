@@ -14,6 +14,7 @@ import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.DocWriteResponse;
 import org.elasticsearch.action.admin.indices.create.CreateIndexResponse;
 import org.elasticsearch.action.admin.indices.readonly.AddIndexBlockResponse;
+import org.elasticsearch.action.admin.indices.readonly.RemoveIndexBlockResponse;
 import org.elasticsearch.action.index.IndexRequestBuilder;
 import org.elasticsearch.action.support.ActiveShardCount;
 import org.elasticsearch.action.support.PlainActionFuture;
@@ -547,6 +548,152 @@ public class SimpleBlocksIT extends ESIntegTestCase {
 
     public static void disableIndexBlock(String index, APIBlock block) {
         disableIndexBlock(index, block.settingName());
+    }
+
+    public void testRemoveBlockToMissingIndex() {
+        IndexNotFoundException e = expectThrows(
+            IndexNotFoundException.class,
+            indicesAdmin().prepareRemoveBlock(randomAddableBlock(), "test")
+        );
+        assertThat(e.getMessage(), is("no such index [test]"));
+    }
+
+    public void testRemoveBlockToOneMissingIndex() {
+        createIndex("test1");
+        final IndexNotFoundException e = expectThrows(
+            IndexNotFoundException.class,
+            indicesAdmin().prepareRemoveBlock(randomAddableBlock(), "test1", "test2")
+        );
+        assertThat(e.getMessage(), is("no such index [test2]"));
+    }
+
+    public void testRemoveBlockNoIndex() {
+        final ActionRequestValidationException e = expectThrows(
+            ActionRequestValidationException.class,
+            indicesAdmin().prepareRemoveBlock(randomAddableBlock())
+        );
+        assertThat(e.getMessage(), containsString("index is missing"));
+    }
+
+    public void testRemoveBlockNullIndex() {
+        expectThrows(NullPointerException.class, () -> indicesAdmin().prepareRemoveBlock(randomAddableBlock(), (String[]) null));
+    }
+
+    public void testCannotRemoveReadOnlyAllowDeleteBlock() {
+        createIndex("test1");
+        final ActionRequestValidationException e = expectThrows(
+            ActionRequestValidationException.class,
+            indicesAdmin().prepareRemoveBlock(APIBlock.READ_ONLY_ALLOW_DELETE, "test1")
+        );
+        assertThat(e.getMessage(), containsString("read_only_allow_delete block is for internal use only"));
+    }
+
+    public void testRemoveIndexBlock() throws Exception {
+        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
+        createIndex(indexName);
+        ensureGreen(indexName);
+
+        final int nbDocs = randomIntBetween(0, 50);
+        indexRandom(
+            randomBoolean(),
+            false,
+            randomBoolean(),
+            IntStream.range(0, nbDocs).mapToObj(i -> prepareIndex(indexName).setId(String.valueOf(i)).setSource("num", i)).collect(toList())
+        );
+
+        final APIBlock block = randomAddableBlock();
+        try {
+            // First add the block
+            AddIndexBlockResponse addResponse = indicesAdmin().prepareAddBlock(block, indexName).get();
+            assertTrue(
+                "Add block [" + block + "] to index [" + indexName + "] not acknowledged: " + addResponse,
+                addResponse.isAcknowledged()
+            );
+            assertIndexHasBlock(block, indexName);
+
+            // Then remove the block
+            RemoveIndexBlockResponse removeResponse = indicesAdmin().prepareRemoveBlock(block, indexName).get();
+            assertTrue(
+                "Remove block [" + block + "] from index [" + indexName + "] not acknowledged: " + removeResponse,
+                removeResponse.isAcknowledged()
+            );
+            assertIndexDoesNotHaveBlock(block, indexName);
+        } finally {
+            // Ensure cleanup
+            disableIndexBlock(indexName, block);
+        }
+
+        indicesAdmin().prepareRefresh(indexName).get();
+        assertHitCount(prepareSearch(indexName).setSize(0), nbDocs);
+    }
+
+    public void testRemoveBlockFromIndexWithoutBlock() throws Exception {
+        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
+        createIndex(indexName);
+        ensureGreen(indexName);
+
+        final APIBlock block = randomAddableBlock();
+        // Try to remove a block that was never added - should still be acknowledged
+        RemoveIndexBlockResponse response = indicesAdmin().prepareRemoveBlock(block, indexName).get();
+        assertTrue("Remove block [" + block + "] from index [" + indexName + "] not acknowledged: " + response, response.isAcknowledged());
+        assertIndexDoesNotHaveBlock(block, indexName);
+    }
+
+    public void testConcurrentRemoveBlock() throws InterruptedException, ExecutionException {
+        final String indexName = randomAlphaOfLength(10).toLowerCase(Locale.ROOT);
+        createIndex(indexName);
+
+        final int nbDocs = randomIntBetween(10, 50);
+        indexRandom(
+            randomBoolean(),
+            false,
+            randomBoolean(),
+            IntStream.range(0, nbDocs).mapToObj(i -> prepareIndex(indexName).setId(String.valueOf(i)).setSource("num", i)).collect(toList())
+        );
+        ensureYellowAndNoInitializingShards(indexName);
+
+        final APIBlock block = randomAddableBlock();
+
+        try {
+            // First add the block
+            AddIndexBlockResponse addResponse = indicesAdmin().prepareAddBlock(block, indexName).get();
+            assertTrue("Add block not acknowledged: " + addResponse, addResponse.isAcknowledged());
+            assertIndexHasBlock(block, indexName);
+
+            // Then try to remove it concurrently
+            final int threadCount = randomIntBetween(2, 5);
+            startInParallel(threadCount, i -> {
+                try {
+                    RemoveIndexBlockResponse removeResponse = indicesAdmin().prepareRemoveBlock(block, indexName).get();
+                    assertTrue("Remove block not acknowledged: " + removeResponse, removeResponse.isAcknowledged());
+                } catch (final Exception e) {
+                    // Concurrent removes might have some conflicts, which is acceptable
+                    logger.debug("Concurrent remove block failed", e);
+                }
+            });
+            assertIndexDoesNotHaveBlock(block, indexName);
+        } finally {
+            disableIndexBlock(indexName, block);
+        }
+    }
+
+    static void assertIndexDoesNotHaveBlock(APIBlock block, final String... indices) {
+        final ClusterState clusterState = clusterAdmin().prepareState(TEST_REQUEST_TIMEOUT).get().getState();
+        final ProjectId projectId = Metadata.DEFAULT_PROJECT_ID;
+        for (String index : indices) {
+            final IndexMetadata indexMetadata = clusterState.metadata().getProject(projectId).indices().get(index);
+            final Settings indexSettings = indexMetadata.getSettings();
+            assertThat(
+                "Index " + index + " should not have block setting [" + block.settingName() + "]",
+                indexSettings.getAsBoolean(block.settingName(), false),
+                is(false)
+            );
+            assertThat(
+                "Index " + index + " should not have block [" + block.getBlock() + "]",
+                clusterState.blocks().hasIndexBlock(projectId, index, block.getBlock()),
+                is(false)
+            );
+        }
     }
 
     /**
